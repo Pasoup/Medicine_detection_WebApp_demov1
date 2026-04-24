@@ -110,9 +110,9 @@ def augment_medicine(
 
 # ── Usage ──
 augment_medicine(
-    input_images=["sefloc1.jpg", "sefloc2.jpg",
-                  "sefloc3.jpg", "sefloc4.jpg"],
-    medicine_name="Pencor",
+    input_images=["prenol1.jpg", "prenol2.jpg",
+                  "prenol3.jpg", "prenol4.jpg"],
+    medicine_name="Prenol",
     output_dir="classifier_data/train/",
     target_count=50
 )

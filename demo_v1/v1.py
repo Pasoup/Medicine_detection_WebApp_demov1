@@ -10,6 +10,7 @@ import re
 import zxingcpp
 from PIL import ImageFont, ImageDraw, Image
 import urllib.request
+import pandas as pd
 import os
 import sys
 
@@ -40,6 +41,7 @@ def put_text(img, text, position, font_size=22, color=(0, 0, 0)):
 
 
 LAYER1_MODEL   = "best.pt"
+MED_BOX_MODEL = "med_box.pt"
 QR_CLASS_ID    = 2
 BOX_CLASS_ID = 0
 LABEL_CLASS_ID = 1
@@ -262,7 +264,7 @@ def layer1_detect(frame, model, conf=0.3):
             pts   = obb_points[i]
             cls   = int(classes[i])
             score = float(scores[i])
-            label = "qr_code" if cls == QR_CLASS_ID else ("box" if cls == BOX_CLASS_ID else "text_label"),
+            label = "qr_code" if cls == QR_CLASS_ID else ("box" if cls == BOX_CLASS_ID else "text_label")
 
             # Show confidence for every detection including filtered ones
             print(f"  [Box {i}] {label} ({cls})  conf={score:.4f}")
@@ -453,11 +455,98 @@ def layer3_read_label(crop):
     return text
 
 
+medicine_id_model = YOLO(MED_BOX_MODEL)
+
+def layer4_identify_medicine(box_crop):
+    """Run the medicine identifier model on a cropped box."""
+    if box_crop is None or box_crop.size == 0:
+        return "UNKNOWN", 0.0
+    
+    results = medicine_id_model(box_crop, conf=0.5)
+    
+    for r in results:
+        if r.obb is not None and len(r.obb):
+            cls  = int(r.obb.cls[0])
+            conf = float(r.obb.conf[0])
+            name = medicine_id_model.names[cls]
+            return name, conf
+        # fallback to regular boxes if not OBB
+        if r.boxes is not None and len(r.boxes):
+            cls  = int(r.boxes.cls[0])
+            conf = float(r.boxes.conf[0])
+            name = medicine_id_model.names[cls]
+            return name, conf
+    
+    return "UNKNOWN", 0.0
+
+def consensus_check(ocr_texts, qr_texts, vision_name, vision_conf):
+    ocr_combined = "".join(ocr_texts).lower().strip()
+    qr_combined  = " ".join(qr_texts).lower().strip()
+
+    # ── QR ───────────────────────────────────────────────────────
+    qr_medicine = qr_combined if qr_combined else None
+
+    # ── OCR ───────────────────────────────────────────────────────
+    ocr_medicine = None
+    if ocr_combined:
+        # Check against YOLO known classes
+        for name in medicine_id_model.names.values():
+            if name.lower() in ocr_combined:
+                ocr_medicine = name.upper()
+                break
+        # If no class match, just use raw OCR text
+        if not ocr_medicine:
+            ocr_medicine = ocr_combined
+
+    # ── Vision ────────────────────────────────────────────────────
+    vision_medicine = vision_name.upper() if vision_name != "UNKNOWN" else None
+
+    # ── Decision ──────────────────────────────────────────────────
+    if qr_medicine:
+        if ocr_medicine and ocr_medicine.lower() in qr_medicine.lower():
+            status     = "✅ VERIFIED — QR + OCR agree"
+            confidence = "HIGH"
+        elif vision_medicine and vision_medicine.lower() in qr_medicine.lower():
+            status     = "✅ VERIFIED — QR + Vision agree"
+            confidence = "HIGH"
+        else:
+            status     = "✅ QR identified"
+            confidence = "HIGH"
+        final_name = qr_medicine
+
+    elif ocr_medicine:
+        if vision_medicine and vision_medicine.lower() in ocr_medicine.lower():
+            status     = "✅ VERIFIED — OCR + Vision agree"
+            confidence = "HIGH"
+        else:
+            status     = "⚠️  OCR only — vision didn't confirm"
+            confidence = "MEDIUM"
+        final_name = ocr_medicine
+
+    elif vision_medicine:
+        status     = "⚠️  VISION ONLY — QR and label not readable"
+        confidence = "MEDIUM"
+        final_name = vision_medicine
+
+    else:
+        status     = "❌ UNKNOWN — all layers failed"
+        confidence = "NONE"
+        final_name = "UNKNOWN"
+
+    return {
+        "status":     status,
+        "confidence": confidence,
+        "qr_name":    qr_medicine,
+        "ocr_name":   ocr_medicine,
+        "ocr_raw":    ocr_combined,
+        "model_name": vision_medicine,
+        "model_conf": vision_conf,
+        "final_name": final_name
+    }
 
 def run_snapshot_pipeline(image_path=None):
     model = YOLO(LAYER1_MODEL)
-    box_count = 0
-  
+
     if image_path:
         frame = cv2.imread(image_path)
         if frame is None:
@@ -466,15 +555,15 @@ def run_snapshot_pipeline(image_path=None):
         print(f"[INFO] Loaded image: {image_path}")
     else:
         print("[INFO] Opening camera — press SPACE to snapshot, Q to quit.")
-        cap   = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         width  = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         fps    = cap.get(cv2.CAP_PROP_FPS)
-
         print(f"[INFO] Camera resolution: {int(width)}x{int(height)} @ {int(fps)}fps")
+
         frame = None
         while True:
             ret, live = cap.read()
@@ -485,7 +574,7 @@ def run_snapshot_pipeline(image_path=None):
             cv2.imshow("Camera Preview", display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord(' '):
-                frame = live.copy()  
+                frame = live.copy()
                 print("[INFO] Snapshot taken.")
                 break
             elif key == ord('q'):
@@ -506,17 +595,16 @@ def run_snapshot_pipeline(image_path=None):
     for i, d in enumerate(detections):
         print(f"  [{i+1}] {d['label'].upper()}  conf={d['conf']:.2f}  bbox={d['bbox']}")
 
-    boxes = []
+    boxes    = []
     contents = []
-    
+
     for d in detections:
         if d["cls"] == BOX_CLASS_ID:
-            # Create a profile for this box
             boxes.append({
                 "box_id": len(boxes) + 1,
-                "bbox": d["bbox"],
-                "conf": d["conf"],
-                "qrs": [],
+                "bbox":   d["bbox"],
+                "conf":   d["conf"],
+                "qrs":    [],
                 "labels": []
             })
         else:
@@ -524,7 +612,7 @@ def run_snapshot_pipeline(image_path=None):
 
     print(f"  [INFO] Tracked {len(boxes)} main boxes.")
 
-
+    # ── Layer 2 & 3 ──
     for i, d in enumerate(contents):
         data_text = None
         label_str = ""
@@ -538,17 +626,15 @@ def run_snapshot_pipeline(image_path=None):
         else:
             print(f"\n  LAYER 3 — Reading Text Label [{i+1}/{len(contents)}]")
             data_text = layer3_read_label(d["crop"]) or "[no text found]"
-            first_line = data_text[0]
-            label_str = f"LBL: {first_line}"
+            first_line = data_text[0] if isinstance(data_text, list) else data_text
+            label_str  = f"LBL: {first_line}"
             x1, y1, _, _ = d["bbox"]
             annotated = put_text(annotated, label_str, (x1, max(20, y1 - 10)), font_size=30, color=(57, 255, 20))
-
 
         lx1, ly1, lx2, ly2 = d["bbox"]
         cx = (lx1 + lx2) / 2
         cy = (ly1 + ly2) / 2
 
-       
         assigned = False
         for b in boxes:
             bx1, by1, bx2, by2 = b["bbox"]
@@ -560,7 +646,7 @@ def run_snapshot_pipeline(image_path=None):
                 assigned = True
                 print(f"    -> Assigned to Box {b['box_id']}")
                 break
-        
+
         if not assigned:
             print(f"    [WARN] Found a {d['label']} but it wasn't inside any detected box!")
 
@@ -569,35 +655,53 @@ def run_snapshot_pipeline(image_path=None):
     print("  FINAL SCAN REPORT")
     print("═"*50)
     print(f"  TOTAL BOXES: {len(boxes)}\n")
+
     inventory = {}
-    
+
     for b in boxes:
-        print(f"BOX {b['box_id']} (Conf: {b['conf']:.2f})")
+        print(f"\n  BOX {b['box_id']} (Conf: {b['conf']:.2f})")
+
+        # ── Layer 4 — Medicine ID ──
+        bx1, by1, bx2, by2 = b["bbox"]
+        box_crop = frame[by1:by2, bx1:bx2]
+        vision_name, vision_conf = layer4_identify_medicine(box_crop)
+        print(f"    [Layer 4] Model says: {vision_name} (conf={vision_conf:.2f})")
+
+        # ── Consensus ──
+        all_ocr_texts = [
+            t for lbl in b["labels"]
+            for t in (lbl if isinstance(lbl, list) else [lbl])
+        ]
+        all_qr_texts = [
+            qr for qr in b["qrs"] if qr and qr != "[decode failed]"
+        ]
+        if all_ocr_texts != []:
+            all_ocr_texts = all_ocr_texts[0] 
+        verdict = consensus_check(all_ocr_texts, all_qr_texts, vision_name, vision_conf)
+        print(f"    [Consensus] {verdict['status']}")
+        print(f"    Final ID:   {verdict['final_name']}")
+        b["verdict"] = verdict
+
         
         if not b["qrs"] and not b["labels"]:
             print("       -> [Empty / No labels detected]")
-            box_type = f"NOTHING: "
         for idx, qr in enumerate(b["qrs"]):
             print(f"       -> QR {idx+1}: {qr}")
-            print(qr[0])
-            box_type = f"QR: {b['qrs'][0]}"
         for idx, lbl in enumerate(b["labels"]):
-            print(f"       -> LBL {idx+1}:")
-            print(lbl[0])
-            box_type = f"LBL: {lbl[0]}"
-         
-        if box_type in inventory:
-            inventory[box_type] += 1
-        else:
-            inventory[box_type] = 1
-        
-        print("  INVENTORY SUMMARY (Mapped items)")
-        print("═"*50)
-        for box_type, count in inventory.items():
-          print(f"  {count}x  {box_type}")
-        print("  " + "-"*40)
+            first_line = lbl[0] if isinstance(lbl, list) else lbl
+            print(f"       -> LBL {idx+1}: {first_line}")
 
-    
+        box_type = verdict["final_name"]
+        inventory[box_type] = inventory.get(box_type, 0) + 1
+
+
+    # Print summary 
+    print("\n  INVENTORY SUMMARY")
+    print("═"*50)
+    for box_type, count in inventory.items():
+        print(f"  {count}x  {box_type}")
+    print("  " + "-"*40)
+
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = f"scan_result_{ts}.jpg"
     cv2.imwrite(out_path, annotated)
@@ -605,7 +709,7 @@ def run_snapshot_pipeline(image_path=None):
 
     cv2.imshow("Scan Result", annotated)
     cv2.waitKey(0)
-    cv2.destroyAllWindows() 
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

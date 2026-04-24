@@ -29,7 +29,7 @@ def _ensure_font(size=22):
     except Exception:
         return ImageFont.load_default()
 
-def put_text(img, text, position, font_size=22, color=(0, 200, 100)):
+def put_text(img, text, position, font_size=22, color=(0, 0, 0)):
     """Drop-in replacement for cv2.putText — supports Thai and Unicode."""
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw    = ImageDraw.Draw(img_pil)
@@ -40,8 +40,9 @@ def put_text(img, text, position, font_size=22, color=(0, 200, 100)):
 
 
 LAYER1_MODEL   = "best.pt"
-QR_CLASS_ID    = 1
-LABEL_CLASS_ID = 0
+QR_CLASS_ID    = 2
+BOX_CLASS_ID = 0
+LABEL_CLASS_ID = 1
 
 reader = easyocr.Reader(['en','th'])
 qreader = QReader()
@@ -84,7 +85,7 @@ def text_quality_score(results):
         total_alpha = vowels + consonants
         if total_alpha > 0:
             vowel_ratio = vowels / total_alpha
-            # Real words: ~35-45% vowels. Penalize extremes (all consonants or all vowels)
+            
             if 0.2 <= vowel_ratio <= 0.6:
                 base *= 1.4   
             else:
@@ -172,7 +173,7 @@ def best_score_for(candidate):
 
 
 def correct_orientation(crop):
-    """Force landscape, upscale, then pick best rotation — called inside get_persepctive()"""
+    
     h, w = crop.shape[:2]
 
     
@@ -204,7 +205,7 @@ def correct_orientation(crop):
 
     return best_crop
 
-def get_persepctive(image, points, pad=10,debug_idx=None):
+def get_persepctive(image, points, pad=10,debug_idx=None,qr_code=False,box=False):
     rect = order_points(points)
     (tl, tr, br, bl) = rect
 
@@ -235,8 +236,8 @@ def get_persepctive(image, points, pad=10,debug_idx=None):
     warped = cv2.warpPerspective(image, M, (max_width, max_height))
 
    
-
-    warped = correct_orientation(warped)
+    if not qr_code and not box:
+        warped = correct_orientation(warped)
 
     
     if debug_idx is not None:
@@ -261,7 +262,7 @@ def layer1_detect(frame, model, conf=0.3):
             pts   = obb_points[i]
             cls   = int(classes[i])
             score = float(scores[i])
-            label = "qr_code" if cls == QR_CLASS_ID else "medicine_label"
+            label = "qr_code" if cls == QR_CLASS_ID else ("box" if cls == BOX_CLASS_ID else "text_label"),
 
             # Show confidence for every detection including filtered ones
             print(f"  [Box {i}] {label} ({cls})  conf={score:.4f}")
@@ -274,9 +275,14 @@ def layer1_detect(frame, model, conf=0.3):
                 print(f"    → SKIPPED (below {min_conf} threshold)")
                 continue
 
-            pad = 15 if cls == QR_CLASS_ID else 10
+            pad = 20 if cls == QR_CLASS_ID else 10
+        
+
+            is_qr = (cls == QR_CLASS_ID)
+            is_box = (cls == BOX_CLASS_ID)
+            print(is_qr,is_box)
             try:
-                crop = get_persepctive(frame, pts, pad=pad, debug_idx=i)
+                crop = get_persepctive(frame, pts, pad=pad, debug_idx=i,qr_code=is_qr,box=is_box)
             except Exception as e:
                 print(f"  [WARN] Perspective warp failed box {i}: {e}")
                 continue
@@ -291,7 +297,7 @@ def layer1_detect(frame, model, conf=0.3):
 
             detections.append({
                 "cls":   cls,
-                "label": "qr_code" if cls == QR_CLASS_ID else "text_label",
+                "label": "qr_code" if cls == QR_CLASS_ID else ("box" if cls == BOX_CLASS_ID else "text_label"),
                 "bbox":  bbox,
                 "crop":  crop,
                 "conf":  score,
@@ -420,11 +426,11 @@ def merge_lines(lines):
     return merged
 
 def layer3_read_label(crop):
-    """Final OCR — receives already-oriented, already-upscaled crop"""
+
     if crop.size == 0:
         return None
 
-    # No upscaling here — correct_orientation already handled it
+   
     kernel = np.array([[0, -1, 0],
                        [-1,  5,-1],
                        [0, -1, 0]])
@@ -436,33 +442,21 @@ def layer3_read_label(crop):
     best_lines = []
     best_score = -1.0
 
-    for img in get_high_contrast_variants(crop):
-        try:
-            results = reader.readtext(img, detail=1, paragraph=False,
-                                      width_ths=0.9, text_threshold=0.5,
-                                      low_text=0.3)
-            lines = [(bbox, text, conf)
-                     for bbox, text, conf in results if conf > 0.25]
-            s = score_result(lines)
-            if s > best_score:
-                best_score = s
-                best_lines = lines
-        except Exception:
-            continue
+    score, text = best_score_for(crop)
 
-    if not best_lines:
-        return None
+    # if not best_lines:
+    #     return None
 
-    best_lines = merge_lines(best_lines)
-    best_lines.sort(key=lambda r: r[0][0][1])
-    best_lines = deduplicate_lines(best_lines)
-    return "\n".join(text for _, text, _ in best_lines)
+    # best_lines = merge_lines(best_lines)
+    # best_lines.sort(key=lambda r: r[0][0][1])
+    # best_lines = deduplicate_lines(best_lines)
+    return text
 
 
 
 def run_snapshot_pipeline(image_path=None):
     model = YOLO(LAYER1_MODEL)
-
+    box_count = 0
   
     if image_path:
         frame = cv2.imread(image_path)
@@ -491,7 +485,7 @@ def run_snapshot_pipeline(image_path=None):
             cv2.imshow("Camera Preview", display)
             key = cv2.waitKey(1) & 0xFF
             if key == ord(' '):
-                frame = live.copy()  # save clean frame without UI text
+                frame = live.copy()  
                 print("[INFO] Snapshot taken.")
                 break
             elif key == ord('q'):
@@ -512,47 +506,96 @@ def run_snapshot_pipeline(image_path=None):
     for i, d in enumerate(detections):
         print(f"  [{i+1}] {d['label'].upper()}  conf={d['conf']:.2f}  bbox={d['bbox']}")
 
-    results_log = []
-    for i, d in enumerate(detections):
-        entry = {
-            "index": i + 1,
-            "type":  d["label"],
-            "bbox":  d["bbox"],
-            "conf":  d["conf"],
-            "data":  None,
-        }
+    boxes = []
+    contents = []
+    
+    for d in detections:
+        if d["cls"] == BOX_CLASS_ID:
+            # Create a profile for this box
+            boxes.append({
+                "box_id": len(boxes) + 1,
+                "bbox": d["bbox"],
+                "conf": d["conf"],
+                "qrs": [],
+                "labels": []
+            })
+        else:
+            contents.append(d)
+
+    print(f"  [INFO] Tracked {len(boxes)} main boxes.")
+
+
+    for i, d in enumerate(contents):
+        data_text = None
+        label_str = ""
 
         if d["cls"] == QR_CLASS_ID:
-            print(f"\n  LAYER 2 — Reading QR/Barcode [{i+1}]")
-            text        = layer2_read_qr(d["crop"])
-            entry["data"] = text or "[decode failed]"
+            print(f"\n  LAYER 2 — Reading QR/Barcode [{i+1}/{len(contents)}]")
+            data_text = layer2_read_qr(d["crop"]) or "[decode failed]"
+            label_str = f"QR: {data_text[:20]}..." if len(data_text) > 20 else f"QR: {data_text}"
             x1, y1, _, _ = d["bbox"]
-            label = f"QR: {text[:20]}..." if text and len(text) > 20 else f"QR: {text or 'FAIL'}"
-            annotated = put_text(annotated, label, (x1, max(20, y1 - 10)),font_size=22, color=(0, 255, 255))
+            annotated = put_text(annotated, label_str, (x1, max(20, y1 - 10)), font_size=22, color=(0, 255, 255))
         else:
-            print(f"\n  LAYER 3 — Reading Text Label [{i+1}]")
-            text          = layer3_read_label(d["crop"])
-            entry["data"] = text or "[no text found]"
-            x1, y1, _, _  = d["bbox"]
-            first_line    = (text or "").split("\n")[0][:20]
-            annotated = put_text(annotated, f"LBL: {first_line}",
-                                  (x1, max(20, y1 - 10)),
-                                  font_size=22, color=(0, 200, 100))
+            print(f"\n  LAYER 3 — Reading Text Label [{i+1}/{len(contents)}]")
+            data_text = layer3_read_label(d["crop"]) or "[no text found]"
+            first_line = data_text[0]
+            label_str = f"LBL: {first_line}"
+            x1, y1, _, _ = d["bbox"]
+            annotated = put_text(annotated, label_str, (x1, max(20, y1 - 10)), font_size=30, color=(57, 255, 20))
 
-        results_log.append(entry)
+
+        lx1, ly1, lx2, ly2 = d["bbox"]
+        cx = (lx1 + lx2) / 2
+        cy = (ly1 + ly2) / 2
+
+       
+        assigned = False
+        for b in boxes:
+            bx1, by1, bx2, by2 = b["bbox"]
+            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                if d["cls"] == QR_CLASS_ID:
+                    b["qrs"].append(data_text)
+                else:
+                    b["labels"].append(data_text)
+                assigned = True
+                print(f"    -> Assigned to Box {b['box_id']}")
+                break
+        
+        if not assigned:
+            print(f"    [WARN] Found a {d['label']} but it wasn't inside any detected box!")
 
     # ── Print Report ──
     print("\n" + "═"*50)
-    print("  SCAN REPORT")
+    print("  FINAL SCAN REPORT")
     print("═"*50)
-    for entry in results_log:
-        print(f"\n  [{entry['index']}] Type : {entry['type'].upper()}")
-        print(f"       Conf : {entry['conf']:.2f}")
-        print(f"       BBox : {entry['bbox']}")
-        print(f"       Data :")
-        for line in str(entry['data']).splitlines():
-            print(f"              {line}")
-    print("\n" + "═"*50)
+    print(f"  TOTAL BOXES: {len(boxes)}\n")
+    inventory = {}
+    
+    for b in boxes:
+        print(f"BOX {b['box_id']} (Conf: {b['conf']:.2f})")
+        
+        if not b["qrs"] and not b["labels"]:
+            print("       -> [Empty / No labels detected]")
+            box_type = f"NOTHING: "
+        for idx, qr in enumerate(b["qrs"]):
+            print(f"       -> QR {idx+1}: {qr}")
+            print(qr[0])
+            box_type = f"QR: {b['qrs'][0]}"
+        for idx, lbl in enumerate(b["labels"]):
+            print(f"       -> LBL {idx+1}:")
+            print(lbl[0])
+            box_type = f"LBL: {lbl[0]}"
+         
+        if box_type in inventory:
+            inventory[box_type] += 1
+        else:
+            inventory[box_type] = 1
+        
+        print("  INVENTORY SUMMARY (Mapped items)")
+        print("═"*50)
+        for box_type, count in inventory.items():
+          print(f"  {count}x  {box_type}")
+        print("  " + "-"*40)
 
     
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -562,9 +605,7 @@ def run_snapshot_pipeline(image_path=None):
 
     cv2.imshow("Scan Result", annotated)
     cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    return results_log
+    cv2.destroyAllWindows() 
 
 
 if __name__ == "__main__":

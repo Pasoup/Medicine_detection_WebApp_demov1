@@ -4,7 +4,7 @@ from roboflow import Roboflow
 def prepare_data():
     rf = Roboflow(api_key="fvxjBIcJXiPzXMrb5Nqt")
     project = rf.workspace("pasus-workspace").project("medicine_label_obb")
-    version = project.version(6)
+    version = project.version(7)
     dataset = version.download("yolov8-obb")
     return dataset
 
